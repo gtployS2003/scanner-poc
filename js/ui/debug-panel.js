@@ -109,7 +109,7 @@ export class DebugPanel {
         ? Object.entries(stats.strategyCounts).map(([k, v]) => `${k} ${v}`).join(' · ')
         : '-'],
       ['คะแนนขอบ', last?.score
-        ? `ตัวเลือก ${last.candidates} ผ่าน ${last.passed} · ต่างสี ${last.score.contrast} (≥ ${CONFIG.detect.score.minContrast}) · เป็นกระดาษ ${Math.round(last.score.paper * 100)}% (≥ ${Math.round(CONFIG.detect.score.minPaper * 100)}%) · ดูดขอบ ${last.snapped ?? 0}/4`
+        ? `ตัวเลือก ${last.candidates} ผ่าน ${last.passed} · ต่างสีด้านที่อ่อนสุด ${last.score.contrast} (≥ ${CONFIG.detect.score.minContrast})${last.score.sides ? ` [${last.score.sides.join(', ')}]` : ''} · เป็นกระดาษ ${Math.round(last.score.paper * 100)}% (≥ ${Math.round(CONFIG.detect.score.minPaper * 100)}%) · ดูดขอบ ${last.snapped ?? 0}/4`
         : last ? `ตัวเลือก ${last.candidates ?? 0}` : '-'],
       ['ความนิ่ง', stability?.rawJitter != null
         ? `สั่นก่อน ${fmtPct(stability.rawJitter)} → หลัง ${fmtPct(stability.smoothJitter)} ของเฟรม · ไม่ย้าย ${stability.jumpsRejected} · ย้าย ${stability.jumpsAccepted}`

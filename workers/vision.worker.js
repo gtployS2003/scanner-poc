@@ -19,6 +19,7 @@ let detectConf = {
   fitTolerance: 0.02,
   fitMinPoints: 8,
   fitMaxShift: 0.03,
+  regionOpen: 0.02,
   snap: null,
   enhanced: null,
   score: null,
@@ -279,6 +280,7 @@ function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
     let edges = track(grayEdges(c, gray, track));
     let edgesSize = { width, height };
     evaluated.push(...scoreAll(labImg, searchCandidates(c, edges, c.RETR_EXTERNAL, false, track), 'gray'));
+    evaluated.push(...scoreAll(labImg, regionCandidates(c, edges, track), 'gray-region'));
     let chosen = choose(evaluated, width, height, prevQuad);
     const grayMs = now() - tGray;
 
@@ -289,7 +291,7 @@ function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
       const { edges: enhEdges, scale } = enhancedEdges(c, lab, track);
       edges = track(enhEdges);
       edgesSize = { width: enhEdges.cols, height: enhEdges.rows };
-      const found = searchCandidates(c, edges, c.RETR_LIST, true, track)
+      const found = [...searchCandidates(c, edges, c.RETR_LIST, true, track), ...regionCandidates(c, edges, track, true)]
         .map((q) => {
           const pts = q.pts.map((p) => ({ x: p.x / scale, y: p.y / scale }));
           return { ...q, pts, area: polygonArea(pts) };   // พื้นที่ในพิกัดเดียวกับวิธีแรก
@@ -320,7 +322,7 @@ function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
       snapped,
       candidates: evaluated.length,
       passed: evaluated.filter((q) => q.ok).length,
-      score: top ? { contrast: round1(top.contrast), paper: round1(top.paper), valid: round1(top.valid) } : null,
+      score: top ? { contrast: round1(top.contrast), sides: top.sides, paper: round1(top.paper), valid: round1(top.valid) } : null,
       brightness: Math.round(brightness),
       sharpness: Math.round(sharpness),
       readMs,
@@ -382,7 +384,8 @@ function scoreBoundary(img, pts) {
   const { sampleDist: d, samplesPerSide: n, paperMinL, paperMaxChroma } = detectConf.score;
   const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
   const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
-  const diffs = [];
+  const sideContrast = [];
+  let validCount = 0;
   let paperHits = 0;
   let insideCount = 0;
   let total = 0;
@@ -391,13 +394,14 @@ function scoreBoundary(img, pts) {
     const a = pts[i];
     const b = pts[(i + 1) % pts.length];
     const len = dist(a, b);
-    if (!len) continue;
+    if (!len) { sideContrast.push(0); continue; }
     let nx = -(b.y - a.y) / len;
     let ny = (b.x - a.x) / len;
     const mx = (a.x + b.x) / 2;
     const my = (a.y + b.y) / 2;
     if (nx * (mx - cx) + ny * (my - cy) < 0) { nx = -nx; ny = -ny; }   // ให้ชี้ออกนอกรูป
 
+    const diffs = [];
     for (let k = 1; k <= n; k++) {
       const t = k / (n + 1);
       const px = a.x + (b.x - a.x) * t;
@@ -412,12 +416,17 @@ function scoreBoundary(img, pts) {
       if (!outside) continue;
       diffs.push(Math.hypot(inside[0] - outside[0], inside[1] - outside[1], inside[2] - outside[2]));
     }
+    validCount += diffs.length;
+    diffs.sort((x, y) => x - y);
+    // ด้านที่ไม่มีจุดให้วัด (ล้นเฟรม) นับเป็น 0 → ไม่ผ่าน เพราะต้องเห็นครบ 4 มุม
+    sideContrast.push(diffs.length >= n * 0.3 ? diffs[Math.floor(diffs.length / 2)] : 0);
   }
-  diffs.sort((x, y) => x - y);
   return {
-    contrast: diffs.length ? diffs[Math.floor(diffs.length / 2)] : 0,
+    // ใช้ด้านที่อ่อนที่สุด: ทุกด้านต้องเป็นขอบจริง ด้านที่ลากผ่านกลางกระดาษ (สองฝั่งขาว) จะถูกคัดทิ้ง
+    contrast: Math.min(...sideContrast),
+    sides: sideContrast.map((v) => Math.round(v)),
     paper: insideCount ? paperHits / insideCount : 0,
-    valid: total ? diffs.length / total : 0,
+    valid: total ? validCount / total : 0,
   };
 }
 
@@ -501,6 +510,23 @@ function stretch(src, dst, pct, maxGain) {
   for (let acc = 0; hi > 0 && (acc += hist[hi]) < cut;) hi--;
   const gain = Math.min(255 / Math.max(hi - lo, 1), maxGain);
   src.convertTo(dst, -1, gain, -lo * gain);
+}
+
+/**
+ * หาสี่เหลี่ยมจาก "พื้นที่" แทนเส้น: ระบายเต็มทุกรูปที่ขอบล้อมไว้ แล้วกัด (open) ส่วนที่บางกว่า kernel ทิ้ง
+ * ใช้กับกรณีที่เส้นอื่น (รอยต่อโต๊ะ ขอบแผ่นรอง) มาชนขอบกระดาษจนต่อเป็นรูปเดียวกัน:
+ * เส้นที่ยื่นออกไปบางแค่ไม่กี่ px จึงหายไป เหลือพื้นที่กระดาษที่เป็นสี่เหลี่ยม
+ */
+function regionCandidates(c, edges, track, allowHull = false) {
+  const outer = track(new c.MatVector());
+  const hierarchy = track(new c.Mat());
+  c.findContours(edges, outer, hierarchy, c.RETR_EXTERNAL, c.CHAIN_APPROX_SIMPLE);
+  const mask = track(c.Mat.zeros(edges.rows, edges.cols, c.CV_8UC1));
+  c.drawContours(mask, outer, -1, new c.Scalar(255), -1);
+  const k = Math.max(3, Math.round(Math.max(edges.cols, edges.rows) * detectConf.regionOpen) | 1);
+  const kernel = track(c.Mat.ones(k, k, c.CV_8U));
+  c.morphologyEx(mask, mask, c.MORPH_OPEN, kernel);
+  return searchCandidates(c, mask, c.RETR_EXTERNAL, allowHull, track);
 }
 
 function searchCandidates(c, edges, mode, allowHull, track) {
