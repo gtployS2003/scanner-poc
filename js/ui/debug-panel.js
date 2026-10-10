@@ -71,7 +71,7 @@ export class DebugPanel {
     this.lastRender = 0;
   }
 
-  render(state, stats, force = false) {
+  render(state, stats, force = false, stability = null) {
     const t = performance.now();
     if (!force && t - this.lastRender < CONFIG.debug.refreshMs) return;
     this.lastRender = t;
@@ -110,6 +110,9 @@ export class DebugPanel {
       ['คะแนนขอบ', last?.score
         ? `ตัวเลือก ${last.candidates} ผ่าน ${last.passed} · ต่างสี ${last.score.contrast} (≥ ${CONFIG.detect.score.minContrast}) · เป็นกระดาษ ${Math.round(last.score.paper * 100)}% (≥ ${Math.round(CONFIG.detect.score.minPaper * 100)}%)`
         : last ? `ตัวเลือก ${last.candidates ?? 0}` : '-'],
+      ['ความนิ่ง', stability?.rawJitter != null
+        ? `สั่นก่อน ${fmtPct(stability.rawJitter)} → หลัง ${fmtPct(stability.smoothJitter)} ของเฟรม · ไม่ย้าย ${stability.jumpsRejected} · ย้าย ${stability.jumpsAccepted}`
+        : '-'],
       ['ความสว่าง', last ? `${last.brightness} / 255` : '-'],
       ['ความคม', last ? `${last.sharpness}` : '-'],
       ['JS heap', heap === null ? 'วัดไม่ได้ใน Browser นี้' : `${heap} MB`],
@@ -128,6 +131,9 @@ function esc(s) {
 }
 function round1(v) {
   return v === null ? null : Math.round(v * 10) / 10;
+}
+function fmtPct(v) {
+  return v == null ? '-' : `${(v * 100).toFixed(2)}%`;
 }
 function fmtMs(v) {
   return v === null ? '-' : `${Math.round(v)} ms`;

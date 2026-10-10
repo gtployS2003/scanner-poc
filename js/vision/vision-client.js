@@ -20,9 +20,10 @@ export class VisionClient {
   }
 
   /** frame.buffer หรือ frame.bitmap ถูกโอนไป worker และใช้ต่อฝั่งนี้ไม่ได้อีก */
-  detect(frame, wantEdges = false) {
+  /** prevQuad = กรอบล่าสุดที่แสดงอยู่ ช่วยให้ worker เลือกสี่เหลี่ยมเดิมต่อเนื่อง */
+  detect(frame, wantEdges = false, prevQuad = null) {
     const transfer = [frame.bitmap ?? frame.buffer];
-    return this.#call('detect', { ...frame, wantEdges }, transfer);
+    return this.#call('detect', { ...frame, wantEdges, prevQuad }, transfer);
   }
 
   warp(frame, quad, outLongSide) {

@@ -12,7 +12,14 @@ export class Overlay {
     this.video = video;
     this.ctx = canvas.getContext('2d');
     this.smoothed = null;
-    this.misses = 0;
+    this.pending = null;
+    this.pendingCount = 0;
+    this.lastSeen = 0;
+    this.lastRaw = null;
+    this.rawJitter = null;
+    this.smoothJitter = null;
+    this.jumpsRejected = 0;
+    this.jumpsAccepted = 0;
     this.cssW = 0;
     this.cssH = 0;
   }
@@ -28,27 +35,68 @@ export class Overlay {
     this.draw();
   }
 
-  /** รับผลตรวจจับล่าสุด คืน quad หลัง smooth (หรือ null เมื่อหายไปนานพอ) */
-  update(quad) {
-    const { smoothing, jumpReset, holdFrames } = CONFIG.overlay;
+  /**
+   * รับผลตรวจจับล่าสุด คืน quad ที่นิ่งแล้ว (หรือ null เมื่อหายไปนานพอ)
+   *  - ขยับน้อย (มือสั่น/noise) → smooth แรง  · ขยับมาก (ตั้งใจเลื่อน) → ตามเร็ว
+   *  - กระโดดไปสี่เหลี่ยมอื่นทันที → ไม่เชื่อ จนกว่าจะเห็นตำแหน่งใหม่ซ้ำ confirmFrames เฟรม
+   *  - ไม่พบในบางเฟรม → คงกรอบไว้ holdMs ก่อนซ่อน
+   */
+  update(quad, t = performance.now()) {
+    const o = CONFIG.overlay;
     if (quad) {
-      this.misses = 0;
-      const jumped = this.smoothed && quad.some((p, i) => distance(p, this.smoothed[i]) > jumpReset);
-      this.smoothed = !this.smoothed || jumped
-        ? quad
-        : quad.map((p, i) => ({
-            x: this.smoothed[i].x * smoothing + p.x * (1 - smoothing),
-            y: this.smoothed[i].y * smoothing + p.y * (1 - smoothing),
+      this.lastSeen = t;
+      if (this.lastRaw) this.rawJitter = ema(this.rawJitter, meanCornerDistance(quad, this.lastRaw));
+      this.lastRaw = quad;
+
+      if (!this.smoothed) {
+        this.smoothed = quad;
+      } else {
+        const d = maxCornerDistance(quad, this.smoothed);
+        if (d > o.jumpReset) {
+          // อาจเป็นสี่เหลี่ยมอื่นที่โผล่มาเฟรมเดียว ต้องเห็นซ้ำก่อนจึงย้าย
+          if (this.pending && maxCornerDistance(quad, this.pending) < o.jumpReset / 2) this.pendingCount++;
+          else { this.pending = quad; this.pendingCount = 1; }
+          if (this.pendingCount >= o.confirmFrames) {
+            this.smoothed = quad;
+            this.pending = null;
+            this.jumpsAccepted++;
+          } else {
+            this.jumpsRejected++;
+          }
+        } else {
+          this.pending = null;
+          const keep = d < o.stillThreshold ? o.smoothingStill : o.smoothingMove;
+          const before = this.smoothed;
+          this.smoothed = quad.map((p, i) => ({
+            x: before[i].x * keep + p.x * (1 - keep),
+            y: before[i].y * keep + p.y * (1 - keep),
           }));
-    } else if (++this.misses > holdFrames) {
+          this.smoothJitter = ema(this.smoothJitter, meanCornerDistance(this.smoothed, before));
+        }
+      }
+    } else if (this.smoothed && t - this.lastSeen > o.holdMs) {
       this.smoothed = null;
+      this.pending = null;
+      this.lastRaw = null;
     }
     this.draw();
     return this.smoothed;
   }
 
+  /** ค่าสำหรับแผงค่าวัด: การสั่นเฉลี่ยต่อเฟรม (สัดส่วนของเฟรม) ก่อนและหลังทำให้นิ่ง */
+  stability() {
+    return {
+      rawJitter: this.rawJitter,
+      smoothJitter: this.smoothJitter,
+      jumpsRejected: this.jumpsRejected,
+      jumpsAccepted: this.jumpsAccepted,
+    };
+  }
+
   clear() {
     this.smoothed = null;
+    this.pending = null;
+    this.lastRaw = null;
     this.draw();
   }
 
@@ -90,4 +138,16 @@ export class Overlay {
 
 function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function maxCornerDistance(q1, q2) {
+  return Math.max(...q1.map((p, i) => distance(p, q2[i])));
+}
+
+function meanCornerDistance(q1, q2) {
+  return q1.reduce((s, p, i) => s + distance(p, q2[i]), 0) / q1.length;
+}
+
+function ema(prev, value, k = 0.2) {
+  return prev === null ? value : prev * (1 - k) + value * k;
 }

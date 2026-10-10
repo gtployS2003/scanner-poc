@@ -164,7 +164,7 @@ function tick() {
   if (ready && performance.now() - state.lastSentAt >= CONFIG.detect.minIntervalMs) {
     runDetect();
   }
-  debugPanel.render(state, stats);
+  debugPanel.render(state, stats, false, overlay.stability());
 }
 
 async function runDetect() {
@@ -176,7 +176,7 @@ async function runDetect() {
     if (!frame) return;
     const grabMs = performance.now() - t0;
 
-    const r = await vision.detect(frame, showEdges);
+    const r = await vision.detect(frame, showEdges, state.quad);
     const roundMs = performance.now() - t0;
     if (state.paused || state.capturing) return;
 
@@ -361,11 +361,22 @@ function buildReport() {
     opencv: state.cvInfo ?? { error: state.cvError },
     camera: state.camInfo,
     detection: stats.summary(),
+    stability: roundStability(overlay.stability()),
     gate: {
       minFps: CONFIG.gate.minFps,
       passed: stats.fps >= CONFIG.gate.minFps,
     },
     lastWarp: state.lastWarp,
+  };
+}
+
+function roundStability(s) {
+  const pct = (v) => (v === null ? null : Math.round(v * 10000) / 100);   // % ของเฟรม
+  return {
+    rawJitterPct: pct(s.rawJitter),
+    smoothJitterPct: pct(s.smoothJitter),
+    jumpsRejected: s.jumpsRejected,
+    jumpsAccepted: s.jumpsAccepted,
   };
 }
 

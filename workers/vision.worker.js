@@ -16,6 +16,9 @@ let detectConf = {
   maxAngle: 140,
   hullFill: 0.9,
   maxCandidates: 8,
+  fitTolerance: 0.02,
+  fitMinPoints: 8,
+  fitMaxShift: 0.03,
   enhanced: null,
   score: null,
 };
@@ -232,7 +235,7 @@ function readBitmap(bitmap, width, height) {
   return readCtx.getImageData(0, 0, width, height).data;
 }
 
-function detect({ buffer, bitmap, width, height, wantEdges }) {
+function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
   const c = requireCv();
   const t0 = now();
   const mats = [];
@@ -275,7 +278,7 @@ function detect({ buffer, bitmap, width, height, wantEdges }) {
     let edges = track(grayEdges(c, gray, track));
     let edgesSize = { width, height };
     evaluated.push(...scoreAll(labImg, searchCandidates(c, edges, c.RETR_EXTERNAL, false, track), 'gray'));
-    let chosen = choose(evaluated);
+    let chosen = choose(evaluated, width, height, prevQuad);
     const grayMs = now() - tGray;
 
     // วิธีที่ 2: enhanced (เมื่อวิธีแรกไม่มีตัวเลือกที่ผ่านเกณฑ์)
@@ -291,7 +294,7 @@ function detect({ buffer, bitmap, width, height, wantEdges }) {
           return { ...q, pts, area: polygonArea(pts) };   // พื้นที่ในพิกัดเดียวกับวิธีแรก
         });
       for (const q of scoreAll(labImg, found, 'enhanced')) evaluated.push(q);
-      chosen = choose(evaluated);
+      chosen = choose(evaluated, width, height, prevQuad);
       enhancedMs = now() - tEnh;
     }
 
@@ -326,7 +329,10 @@ function detect({ buffer, bitmap, width, height, wantEdges }) {
 const round1 = (v) => Math.round(v * 10) / 10;
 
 function scoreAll(labImg, candidates, strategy) {
-  return candidates.map((q) => {
+  const margin = 0.02 * Math.max(labImg.width, labImg.height);
+  const inFrame = (pts) => pts.every((p) =>
+    p.x >= -margin && p.y >= -margin && p.x <= labImg.width + margin && p.y <= labImg.height + margin);
+  return candidates.filter((q) => inFrame(q.pts)).map((q) => {
     const s = scoreBoundary(labImg, q.pts);
     const conf = detectConf.score;
     const ok = s.valid >= conf.minValid && s.contrast >= conf.minContrast && s.paper >= conf.minPaper;
@@ -334,13 +340,25 @@ function scoreAll(labImg, candidates, strategy) {
   });
 }
 
-/** จากตัวเลือกที่ผ่านเกณฑ์ เลือกตัวที่ใหญ่ที่สุด (กระดาษครอบกรอบที่พิมพ์ข้างในเสมอ) */
-function choose(evaluated) {
-  let best = null;
-  for (const q of evaluated) {
-    if (q.ok && (!best || q.area > best.area)) best = q;
+/**
+ * จากตัวเลือกที่ผ่านเกณฑ์:
+ *  - ถ้ามีตัวที่อยู่ใกล้กรอบเดิม (prevQuad) ใช้ตัวนั้น กรอบจึงไม่สลับไปมาระหว่างสี่เหลี่ยมที่ผ่านพอ ๆ กัน
+ *  - ไม่มี → เลือกตัวที่ใหญ่ที่สุด (กระดาษครอบกรอบที่พิมพ์ข้างในเสมอ)
+ */
+function choose(evaluated, width, height, prevQuad) {
+  const ok = evaluated.filter((q) => q.ok);
+  if (!ok.length) return null;
+  if (prevQuad) {
+    let near = null;
+    let nearDist = Infinity;
+    for (const q of ok) {
+      const n = normalize(orderCorners(q.pts), width, height);
+      const d = n.reduce((sum, p, i) => sum + Math.hypot(p.x - prevQuad[i].x, p.y - prevQuad[i].y), 0) / 4;
+      if (d < nearDist) { nearDist = d; near = q; }
+    }
+    if (near && nearDist <= detectConf.stickRadius) return near;
   }
-  return best;
+  return ok.reduce((best, q) => (q.area > best.area ? q : best));
 }
 
 /**
@@ -477,15 +495,18 @@ function stretch(src, dst, pct, maxGain) {
 function searchCandidates(c, edges, mode, allowHull, track) {
   const contours = track(new c.MatVector());
   const hierarchy = track(new c.Mat());
-  c.findContours(edges, contours, hierarchy, mode, c.CHAIN_APPROX_SIMPLE);
-  return findCandidates(contours, edges.cols * edges.rows, allowHull);
+  // เก็บทุกจุดของขอบ (NONE) เพื่อใช้ลากเส้นตรงที่พอดีที่สุดในแต่ละด้าน
+  c.findContours(edges, contours, hierarchy, mode, c.CHAIN_APPROX_NONE);
+  return findCandidates(contours, edges.cols, edges.rows, allowHull);
 }
 
 /**
  * รวบรวมสี่เหลี่ยมทุกตัวที่ผ่านเกณฑ์ ขนาด · นูน · มุมภายใน (เรียงจากใหญ่ไปเล็ก ไม่เกิน maxCandidates)
  * contour ที่ไม่เป็น 4 มุมตรง ๆ และ allowHull จะลองใช้ Convex Hull ของ contour แทน
  */
-function findCandidates(contours, frameArea, allowHull) {
+function findCandidates(contours, width, height, allowHull) {
+  const frameArea = width * height;
+  const bounds = { width, height };
   const minArea = frameArea * detectConf.minAreaRatio;
   const maxArea = frameArea * detectConf.maxAreaRatio;
   const inRange = (a) => a >= minArea && a <= maxArea;
@@ -500,12 +521,14 @@ function findCandidates(contours, frameArea, allowHull) {
         const peri = geom.arcLength(cnt);
         for (const eps of detectConf.epsilons) {
           // OpenCV 5 คืนผลของ vector เป็น Mat 1 มิติ จึงนับจำนวนจุดแทนการดู .rows
-          const pts = geom.approx(cnt, eps * peri);
-          if (isDocumentQuad(pts)) {
-            out.push({ pts, area: polygonArea(pts), hull: false });
-            direct = true;
-            break;
-          }
+          const rough = geom.approx(cnt, eps * peri);
+          if (!isDocumentQuad(rough)) continue;
+          // มุมจาก approxPolyDP เป็นจุดบนขอบที่สั่นตาม noise; ใช้จุดตัดของเส้นที่ fit แทน
+          const fitted = fitCorners(matPoints(cnt), rough, bounds);
+          const pts = fitted && isDocumentQuad(fitted) ? fitted : rough;
+          out.push({ pts, area: polygonArea(pts), hull: false });
+          direct = true;
+          break;
         }
       }
 
@@ -520,7 +543,7 @@ function findCandidates(contours, frameArea, allowHull) {
           const rough = approxClosed(hull, eps * hullPeri);
           if (rough.length !== 4) continue;
           // มุมกระดาษมักหายไปเมื่อขอบขาดเป็นช่วง จึงต่อเส้นขอบแต่ละด้านแล้วหาจุดตัดเป็นมุมจริง
-          const q = refineCorners(hull, rough);
+          const q = fitCorners(pts, rough, bounds) ?? refineCorners(hull, rough);
           // hull ต้องเต็มสี่เหลี่ยมเกือบทั้งหมด ไม่ใช่รูปหลายเหลี่ยมที่ถูกบีบให้เหลือ 4 มุม
           if (q && isDocumentQuad(q) && hullArea / polygonArea(q) >= detectConf.hullFill) {
             out.push({ pts: q, area: polygonArea(q), hull: true });
@@ -534,6 +557,81 @@ function findCandidates(contours, frameArea, allowHull) {
   }
   out.sort((x, y) => y.area - x.area);
   return out.slice(0, detectConf.maxCandidates);
+}
+
+/**
+ * หามุมจากจุดตัดของเส้นตรง 4 เส้นที่ fit ผ่านจุดขอบจริง
+ * แต่ละด้านใช้เฉพาะจุดช่วงกลาง 10–90% ของด้าน และห่างจากแนวด้านไม่เกิน fitTolerance
+ * แล้ว fit ซ้ำโดยตัดจุดที่ห่างเส้นเกิน 2.5 เท่าของค่ามัธยฐานทิ้ง (กันกิ่งจากตัวอักษร เงา ขอบโต๊ะ)
+ * ถ้ามุมที่ได้หลุดนอกเฟรม หรือขยับจากมุมเดิมเกิน fitMaxShift คืน null ให้ใช้มุมเดิม
+ */
+function fitCorners(points, rough, bounds) {
+  const lines = [];
+  for (let s = 0; s < 4; s++) {
+    const a = rough[s];
+    const b = rough[(s + 1) % 4];
+    const len = dist(a, b);
+    if (!len) return null;
+    const ux = (b.x - a.x) / len;
+    const uy = (b.y - a.y) / len;
+    const tol = Math.max(1.5, len * detectConf.fitTolerance);
+    let near = [];
+    for (const p of points) {
+      const t = (p.x - a.x) * ux + (p.y - a.y) * uy;
+      if (t < len * 0.1 || t > len * 0.9) continue;
+      if (Math.abs((p.x - a.x) * uy - (p.y - a.y) * ux) <= tol) near.push(p);
+    }
+    if (near.length < detectConf.fitMinPoints) return null;
+    let line = fitLine(near);
+    for (let iter = 0; iter < 2; iter++) {
+      const res = near.map((p) => lineDistance(p, line));
+      const med = [...res].sort((x, y) => x - y)[Math.floor(res.length / 2)];
+      const kept = near.filter((_, i) => res[i] <= Math.max(1, med * 2.5));
+      if (kept.length < detectConf.fitMinPoints || kept.length === near.length) break;
+      near = kept;
+      line = fitLine(near);
+    }
+    lines.push(line);
+  }
+
+  const maxShift = detectConf.fitMaxShift * Math.max(bounds.width, bounds.height);
+  const margin = 0.02 * Math.max(bounds.width, bounds.height);
+  const corners = [];
+  for (let s = 0; s < 4; s++) {
+    // มุม s อยู่ระหว่างด้าน s-1 (เข้า) กับด้าน s (ออก)
+    const p = intersect(lines[(s + 3) % 4], lines[s]);
+    if (!p) return null;
+    if (dist(p, rough[s]) > maxShift) return null;
+    if (p.x < -margin || p.y < -margin || p.x > bounds.width + margin || p.y > bounds.height + margin) return null;
+    corners.push(p);
+  }
+  return corners;
+}
+
+/** ระยะตั้งฉากจากจุดถึงเส้น (เส้นแทนด้วยจุด 2 จุดห่างกัน 1 หน่วย ตามที่ fitLine คืน) */
+function lineDistance(p, [a, b]) {
+  return Math.abs((p.x - a.x) * (b.y - a.y) - (p.y - a.y) * (b.x - a.x));
+}
+
+/** เส้นตรงที่พอดีที่สุดผ่านจุดชุดหนึ่ง (แกนหลักของ covariance) คืนเป็นจุด 2 จุดบนเส้น */
+function fitLine(pts) {
+  let mx = 0;
+  let my = 0;
+  for (const p of pts) { mx += p.x; my += p.y; }
+  mx /= pts.length;
+  my /= pts.length;
+  let sxx = 0;
+  let sxy = 0;
+  let syy = 0;
+  for (const p of pts) {
+    const dx = p.x - mx;
+    const dy = p.y - my;
+    sxx += dx * dx;
+    sxy += dx * dy;
+    syy += dy * dy;
+  }
+  const angle = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  return [{ x: mx, y: my }, { x: mx + Math.cos(angle), y: my + Math.sin(angle) }];
 }
 
 /**
@@ -639,7 +737,7 @@ function convexHull(pts) {
 /* -------------------------------------------------------------- geometry
  * OpenCV 5 ย้ายฟังก์ชันเรขาคณิต (เช่น isContourConvex) จาก imgproc ไปโมดูล geometry
  * ซึ่ง build ของ opencv.js อาจไม่ได้รวมไว้ จึงใช้ของ OpenCV เมื่อมี และใช้ JS แทนเมื่อไม่มี
- * contour ที่ได้จาก CHAIN_APPROX_SIMPLE บนเฟรม 480 px มีจุดไม่มาก ฝั่ง JS จึงเร็วพอ
+ * contour บนเฟรม 480 px มีจุดไม่กี่พันจุด ฝั่ง JS จึงเร็วพอ
  */
 let geom = null;
 
