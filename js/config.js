@@ -11,7 +11,7 @@
 const params = new URLSearchParams(location.search);
 
 /** เปลี่ยนทุกครั้งที่ส่งไฟล์ชุดใหม่ ใช้ยืนยันว่ามือถือโหลดโค้ดล่าสุดแล้ว (ดูแถว "เวอร์ชัน") */
-export const APP_VERSION = 'm0-r8';
+export const APP_VERSION = 'm0-r9';
 
 const RESOLUTIONS = {
   '720': [1280, 720],
@@ -66,12 +66,14 @@ export const CONFIG = Object.freeze({
   },
   grab: params.get('grab') === 'canvas' ? 'canvas' : 'bitmap',
   overlay: {
-    smoothingStill: 0.85,      // ขยับน้อย: น้ำหนักของตำแหน่งเดิม (นิ่งมาก)
-    smoothingMove: 0.35,       // ขยับมาก: ตามตำแหน่งใหม่เร็ว
+    smoothingStill: 0.75,      // ขยับน้อย: น้ำหนักของตำแหน่งเดิม (การวาดช่วยให้นุ่มอีกชั้น จึงลดจาก 0.85)
+    smoothingMove: 0.3,        // ขยับมาก: ตามตำแหน่งใหม่เร็ว
     stillThreshold: 0.02,      // มุมขยับไม่เกิน 2% ของเฟรม = ถือว่าแค่สั่น (Nothing 4a สั่นดิบราว 1.3%)
     jumpReset: 0.08,           // มุมใดขยับเกิน 8% ของเฟรม = อาจเป็นสี่เหลี่ยมอื่น
     confirmFrames: 3,          // ต้องเห็นตำแหน่งใหม่ซ้ำกี่เฟรมจึงย้ายกรอบ
     holdMs: 500,               // ไม่พบติดกันนานเท่านี้จึงซ่อนกรอบ
+    renderTau: 90,             // ms ที่กรอบบนจอใช้เลื่อนเข้าหาตำแหน่งใหม่ (มาก = นุ่มขึ้นแต่ตามช้าลง)
+    fadeTau: 120,              // ms ที่กรอบใช้จางเข้า/ออก
   },
   output: { longSide: 2000, jpegQuality: 0.85 },
   gate: { minFps: 5 },

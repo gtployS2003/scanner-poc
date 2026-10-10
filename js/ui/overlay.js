@@ -5,6 +5,11 @@ const LAMP = '#ffb23e';
 /**
  * วาดกรอบเอกสารบน canvas ที่ซ้อนกับ <video object-fit: cover>
  * พิกัด quad ที่รับเข้ามาเป็นสัดส่วน 0–1 ของเฟรม video
+ *
+ * แยก 2 จังหวะ:
+ *  - update()  : เรียกเมื่อได้ผลตรวจจับ (6–20 ครั้ง/วินาที) → ติดตามและกรองเป็น "ตำแหน่งเป้าหมาย"
+ *  - render()  : เรียกทุกเฟรมของจอ (60 ครั้ง/วินาที) → เลื่อนกรอบที่แสดงเข้าหาเป้าหมายแบบนุ่ม
+ * กรอบจึงไม่กระโดดเป็นขั้นตามจังหวะการตรวจจับ
  */
 export class Overlay {
   constructor(canvas, video) {
@@ -20,6 +25,9 @@ export class Overlay {
     this.smoothJitter = null;
     this.jumpsRejected = 0;
     this.jumpsAccepted = 0;
+    this.display = null;       // มุมที่วาดอยู่จริงบนจอ
+    this.opacity = 0;
+    this.lastRender = 0;
     this.cssW = 0;
     this.cssH = 0;
   }
@@ -79,7 +87,6 @@ export class Overlay {
       this.pending = null;
       this.lastRaw = null;
     }
-    this.draw();
     return this.smoothed;
   }
 
@@ -97,6 +104,36 @@ export class Overlay {
     this.smoothed = null;
     this.pending = null;
     this.lastRaw = null;
+    this.display = null;
+    this.opacity = 0;
+    this.draw();
+  }
+
+  /** เรียกทุกเฟรมของจอจาก requestAnimationFrame */
+  render(now = performance.now()) {
+    const dt = this.lastRender ? Math.min(now - this.lastRender, 100) : 16;
+    this.lastRender = now;
+    const { renderTau, fadeTau } = CONFIG.overlay;
+    const target = this.smoothed;
+
+    if (target) {
+      if (!this.display || this.opacity < 0.05) {
+        this.display = target.map((p) => ({ ...p }));   // โผล่ใหม่: วางตรงเป้าหมายแล้วค่อยจางเข้า
+      } else {
+        // ค่อย ๆ เข้าหาเป้าหมายด้วยค่าคงที่เวลา renderTau (ms) ไม่ขึ้นกับ FPS ของการตรวจจับ
+        const k = 1 - Math.exp(-dt / renderTau);
+        this.display = this.display.map((p, i) => ({
+          x: p.x + (target[i].x - p.x) * k,
+          y: p.y + (target[i].y - p.y) * k,
+        }));
+      }
+    }
+    const goal = target ? 1 : 0;
+    this.opacity += (goal - this.opacity) * (1 - Math.exp(-dt / fadeTau));
+    if (!target && this.opacity < 0.02) {
+      this.opacity = 0;
+      this.display = null;
+    }
     this.draw();
   }
 
@@ -113,9 +150,10 @@ export class Overlay {
   draw() {
     const { ctx } = this;
     ctx.clearRect(0, 0, this.cssW, this.cssH);
-    if (!this.smoothed || !this.video.videoWidth) return;
+    if (!this.display || !this.opacity || !this.video.videoWidth) return;
 
-    const pts = this.smoothed.map((p) => this.#toScreen(p));
+    const pts = this.display.map((p) => this.#toScreen(p));
+    ctx.globalAlpha = this.opacity;
 
     ctx.beginPath();
     pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
@@ -133,6 +171,7 @@ export class Overlay {
       ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 }
 

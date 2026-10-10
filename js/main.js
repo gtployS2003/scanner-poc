@@ -164,6 +164,7 @@ function tick() {
   if (ready && performance.now() - state.lastSentAt >= CONFIG.detect.minIntervalMs) {
     runDetect();
   }
+  overlay.render(performance.now());
   debugPanel.render(state, stats, false, overlay.stability());
 }
 
