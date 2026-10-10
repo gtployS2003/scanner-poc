@@ -8,7 +8,17 @@
 /* global importScripts */
 
 let cv = null;
-let detectConf = { minAreaRatio: 0.15, epsilons: [0.02, 0.03, 0.045] };
+let detectConf = {
+  minAreaRatio: 0.15,
+  maxAreaRatio: 0.95,
+  epsilons: [0.02, 0.03, 0.045],
+  minAngle: 40,
+  maxAngle: 140,
+  hullFill: 0.9,
+  maxCandidates: 8,
+  enhanced: null,
+  score: null,
+};
 
 const now = () => performance.now();
 
@@ -18,7 +28,8 @@ self.onmessage = async ({ data }) => {
     if (type === 'init') {
       reply(id, await init(payload));
     } else if (type === 'detect') {
-      reply(id, detect(payload));
+      const result = detect(payload);
+      reply(id, result, result.edges ? [result.edges] : []);
     } else if (type === 'warp') {
       const result = warp(payload);
       reply(id, result, [result.buffer]);
@@ -39,23 +50,49 @@ function reply(id, result, transfer = []) {
 async function init({ urls, timeoutMs, detect }) {
   if (detect) detectConf = { ...detectConf, ...detect };
   const t0 = now();
-  let source = null;
+  const deadline = t0 + timeoutMs;
+  const remaining = () => Math.max(1, deadline - now());
   const errors = [];
+  let source = null;
+  let bytes = null;
+  let downloadMs = null;
+  let evalMs = null;
 
   for (const url of urls) {
     try {
-      importScripts(url);          // โหลดแบบ synchronous; ไฟล์ราว 8–10 MB
-      if (!self.cv) throw new Error('ไม่พบตัวแปร cv');
+      const tDl = now();
+      let scriptUrl = url;
+      try {
+        // ดาวน์โหลดเองเพื่อรายงานความคืบหน้าและตรวจว่าได้ไฟล์ JS จริง
+        const dl = await withTimeout(download(url), remaining(), 'ดาวน์โหลดเกินเวลาที่กำหนด');
+        scriptUrl = dl.blobUrl;
+        bytes = dl.bytes;
+      } catch (e) {
+        // ปลายทางที่ไม่เปิด CORS (เช่น docs.opencv.org) fetch ไม่ได้ ให้ importScripts ตรงแทน
+        if (!(e instanceof TypeError)) throw e;
+        progress({ phase: 'download', note: 'fetch ไม่ได้ (CORS) ใช้ importScripts ตรง', url });
+      }
+      downloadMs = now() - tDl;
+
+      progress({ phase: 'evaluate', url, bytes });
+      const tEval = now();
+      importScripts(scriptUrl);
+      evalMs = now() - tEval;
+      if (scriptUrl !== url) URL.revokeObjectURL(scriptUrl);
+      if (!self.cv) throw new Error('โหลดสคริปต์แล้วแต่ไม่พบตัวแปร cv');
       source = url;
       break;
     } catch (e) {
       errors.push(`${url}: ${e.message}`);
+      progress({ phase: 'fallback', url, error: e.message });
     }
   }
   if (!source) throw new Error(`โหลด OpenCV.js ไม่สำเร็จ (${errors.join(' | ')})`);
 
-  const tScript = now();
-  cv = await withTimeout(resolveCv(self.cv), timeoutMs, 'OpenCV runtime ไม่พร้อมภายในเวลาที่กำหนด');
+  progress({ phase: 'runtime', cvType: describe(self.cv) });
+  const tRuntime = now();
+  const resolved = await withTimeout(resolveCv(self.cv), remaining(), `OpenCV runtime ไม่พร้อมภายในเวลาที่กำหนด (cv เป็น ${describe(self.cv)})`);
+  cv = resolved.lib;
   const tReady = now();
   geom = buildGeometry(cv);
 
@@ -63,19 +100,88 @@ async function init({ urls, timeoutMs, detect }) {
     source,
     version: readVersion(cv),
     geometry: geom.source,
-    scriptMs: Math.round(tScript - t0),
-    runtimeMs: Math.round(tReady - tScript),
+    sizeMB: bytes ? Math.round(bytes / 104857.6) / 10 : null,
+    downloadMs: Math.round(downloadMs),
+    evalMs: Math.round(evalMs),
+    runtimeMs: Math.round(tReady - tRuntime),
     totalMs: Math.round(tReady - t0),
   };
 }
 
-/** รองรับทั้ง build ที่ cv เป็น Promise และ build ที่ต้องรอ onRuntimeInitialized */
-async function resolveCv(candidate) {
-  // ห้าม await object ของ Emscripten ตรง ๆ: build เก่ามี .then() ที่ทำให้วนไม่จบ
-  if (candidate instanceof Promise) candidate = await candidate;
-  if (candidate.Mat) return candidate;
-  await new Promise((resolve) => { candidate.onRuntimeInitialized = resolve; });
-  return candidate;
+function progress(info) {
+  self.postMessage({ type: 'progress', ...info });
+}
+
+/** ดาวน์โหลดเป็น Blob URL พร้อมรายงาน % ทุก ~250 ms */
+async function download(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const type = res.headers.get('content-type') ?? '';
+  if (type.includes('text/html')) throw new Error('ได้หน้า HTML แทนไฟล์ JavaScript (ไฟล์อาจไม่มีอยู่ที่ path นี้)');
+
+  const total = Number(res.headers.get('content-length')) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let loaded = 0;
+  let lastPost = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    loaded += value.length;
+    if (now() - lastPost > 250) {
+      lastPost = now();
+      progress({ phase: 'download', url, loaded, total });
+    }
+  }
+  progress({ phase: 'download', url, loaded, total: total || loaded });
+  const blob = new Blob(chunks, { type: 'text/javascript' });
+  return { blobUrl: URL.createObjectURL(blob), bytes: loaded };
+}
+
+/**
+ * opencv.js แต่ละ build ส่ง cv มาไม่เหมือนกัน:
+ *  - object ที่มี Mat พร้อมใช้แล้ว
+ *  - object ที่ต้องรอ onRuntimeInitialized
+ *  - Promise ที่ resolve เป็น cv
+ *  - ฟังก์ชัน factory (MODULARIZE) ที่ต้องเรียกก่อน
+ *
+ * สำคัญ: object ของ Emscripten บาง build มีเมธอด .then() ที่เรียก callback ด้วยตัวเอง
+ * ถ้า resolve Promise ด้วย object นั้นตรง ๆ JavaScript จะเรียก .then() วนไม่รู้จบ
+ * จน worker ค้างทั้งตัว (timeout ก็ไม่ทำงาน) จึงห่อไว้ใน { lib } เสมอและไม่ await ตัว cv ตรง ๆ
+ */
+function resolveCv(candidate) {
+  if (typeof candidate === 'function' && !candidate.Mat) candidate = candidate();
+  if (candidate instanceof Promise) {
+    return candidate.then((lib) => waitForMat(lib));
+  }
+  return waitForMat(candidate);
+}
+
+function waitForMat(lib) {
+  if (lib?.Mat) return Promise.resolve({ lib });
+  // รอทั้ง callback และตรวจซ้ำทุก 50 ms เผื่อ callback ถูกเรียกไปแล้วก่อนเราจะผูก
+  return new Promise((resolve) => {
+    let timer = null;
+    const check = () => {
+      if (!lib.Mat) return;
+      clearInterval(timer);
+      resolve({ lib });
+    };
+    const previous = lib.onRuntimeInitialized;
+    lib.onRuntimeInitialized = () => {
+      if (typeof previous === 'function') previous();
+      check();
+    };
+    timer = setInterval(check, 50);
+  });
+}
+
+function describe(v) {
+  if (v === undefined) return 'undefined';
+  if (v instanceof Promise) return 'Promise';
+  if (typeof v === 'function') return v.Mat ? 'function+Mat' : 'function';
+  return v && v.Mat ? 'object+Mat' : typeof v;
 }
 
 function withTimeout(promise, ms, message) {
@@ -101,17 +207,44 @@ function requireCv() {
   return cv;
 }
 
-/* ---------------------------------------------------------------- detect */
+/* ---------------------------------------------------------------- detect
+ * หาสี่เหลี่ยมที่เป็นไปได้ด้วย 2 วิธี:
+ *  1. gray     : ขอบจากภาพขาวดำ (เร็ว ได้ผลดีบนพื้นเข้ม)
+ *  2. enhanced : ใช้เมื่อวิธีแรกไม่มีตัวเลือกที่ผ่านเกณฑ์ — แยกช่อง Lab, เพิ่ม Contrast เฉพาะที่ (CLAHE)
+ *                และยืดช่องสี a/b เพื่อจับขอบกระดาษขาวบนพื้นสีอ่อน ถ้าขอบขาดใช้ Convex Hull ปิดรูป
+ *
+ * จากนั้นให้คะแนนทุกตัวเลือกด้วยการสุ่มดูสีสองฝั่งของขอบ (scoreBoundary)
+ * ขอบกระดาษจริง: ด้านในเป็นกระดาษ (สว่าง สีไม่จัด) และด้านในต่างจากด้านนอก
+ * กรอบตารางที่พิมพ์บนฟอร์มมีกระดาษทั้งสองฝั่ง ส่วนกรอบโต๊ะ/เงามีด้านในไม่ใช่กระดาษ จึงถูกคัดออก
+ */
 
-function detect({ buffer, width, height }) {
+let readCanvas = null;
+let readCtx = null;
+
+/** อ่านพิกเซลจาก ImageBitmap ที่ main thread ส่งมา (ย้ายงานอ่าน GPU → CPU มาไว้ใน worker) */
+function readBitmap(bitmap, width, height) {
+  if (!readCanvas || readCanvas.width !== width || readCanvas.height !== height) {
+    readCanvas = new OffscreenCanvas(width, height);
+    readCtx = readCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  readCtx.drawImage(bitmap, 0, 0, width, height);   // ระบุขนาดเสมอ เผื่อ browser ไม่ทำ resize ให้
+  bitmap.close();
+  return readCtx.getImageData(0, 0, width, height).data;
+}
+
+function detect({ buffer, bitmap, width, height, wantEdges }) {
   const c = requireCv();
   const t0 = now();
   const mats = [];
   const track = (m) => { mats.push(m); return m; };
 
   try {
+    const tRead = now();
+    const pixels = bitmap ? readBitmap(bitmap, width, height) : new Uint8Array(buffer);
+    const readMs = now() - tRead;
+
     const src = track(new c.Mat(height, width, c.CV_8UC4));
-    src.data.set(new Uint8Array(buffer));
+    src.data.set(pixels);
 
     const gray = track(new c.Mat());
     c.cvtColor(src, gray, c.COLOR_RGBA2GRAY);
@@ -119,7 +252,7 @@ function detect({ buffer, width, height }) {
     // ความสว่าง: ค่าเฉลี่ย 0–255
     const brightness = c.mean(gray)[0];
 
-    // ความคม: Variance of Laplacian (ยิ่งสูงยิ่งคม) — M0 วัดทั้งเฟรม, M3 จะวัดเฉพาะในกรอบเอกสาร
+    // ความคม: Variance of Laplacian — ขึ้นกับปริมาณตัวอักษรด้วย จึงต้องใช้แบบเทียบสัมพัทธ์ใน M3
     const lap = track(new c.Mat());
     c.Laplacian(gray, lap, c.CV_64F);
     const mean = track(new c.Mat());
@@ -127,63 +260,380 @@ function detect({ buffer, width, height }) {
     c.meanStdDev(lap, mean, std);
     const sharpness = std.doubleAt(0, 0) ** 2;
 
-    // ขอบ: Blur → Canny (threshold จาก Otsu ปรับตามแสงอัตโนมัติ) → Dilate เชื่อมขอบที่ขาด
-    const blurred = track(new c.Mat());
-    c.GaussianBlur(gray, blurred, new c.Size(5, 5), 0);
-    const bin = track(new c.Mat());
-    const otsu = c.threshold(blurred, bin, 0, 255, c.THRESH_BINARY + c.THRESH_OTSU);
-    const edges = track(new c.Mat());
-    c.Canny(blurred, edges, otsu * 0.5, otsu);
-    const kernel = track(c.Mat.ones(3, 3, c.CV_8U));
-    c.dilate(edges, edges, kernel);
-
-    const contours = track(new c.MatVector());
-    const hierarchy = track(new c.Mat());
-    c.findContours(edges, contours, hierarchy, c.RETR_EXTERNAL, c.CHAIN_APPROX_SIMPLE);
+    // Lab ใช้ทั้งให้คะแนนขอบและวิธี enhanced
+    const rgb = track(new c.Mat());
+    c.cvtColor(src, rgb, c.COLOR_RGBA2RGB);
+    const lab = track(new c.Mat());
+    c.cvtColor(rgb, lab, c.COLOR_RGB2Lab);
+    const labImg = { data: lab.data, width, height };
 
     const frameArea = width * height;
-    const best = findBestQuad(c, contours, frameArea);
+    const evaluated = [];
+
+    // วิธีที่ 1: gray
+    const tGray = now();
+    let edges = track(grayEdges(c, gray, track));
+    let edgesSize = { width, height };
+    evaluated.push(...scoreAll(labImg, searchCandidates(c, edges, c.RETR_EXTERNAL, false, track), 'gray'));
+    let chosen = choose(evaluated);
+    const grayMs = now() - tGray;
+
+    // วิธีที่ 2: enhanced (เมื่อวิธีแรกไม่มีตัวเลือกที่ผ่านเกณฑ์)
+    let enhancedMs = 0;
+    if (!chosen && detectConf.enhanced?.enabled) {
+      const tEnh = now();
+      const { edges: enhEdges, scale } = enhancedEdges(c, lab, track);
+      edges = track(enhEdges);
+      edgesSize = { width: enhEdges.cols, height: enhEdges.rows };
+      const found = searchCandidates(c, edges, c.RETR_LIST, true, track)
+        .map((q) => {
+          const pts = q.pts.map((p) => ({ x: p.x / scale, y: p.y / scale }));
+          return { ...q, pts, area: polygonArea(pts) };   // พื้นที่ในพิกัดเดียวกับวิธีแรก
+        });
+      for (const q of scoreAll(labImg, found, 'enhanced')) evaluated.push(q);
+      chosen = choose(evaluated);
+      enhancedMs = now() - tEnh;
+    }
+
+    // ตัวเลือกที่ดีที่สุดแม้ไม่ผ่าน ไว้ดูใน debug ว่าคะแนนห่างจากเกณฑ์เท่าไร
+    const top = chosen ?? evaluated.sort((x, y) => y.contrast - x.contrast)[0] ?? null;
 
     return {
       width,
       height,
-      quad: best ? normalize(orderCorners(best.pts), width, height) : null,
-      areaRatio: best ? best.area / frameArea : 0,
-      contourCount: contours.size(),
+      quad: chosen ? normalize(orderCorners(chosen.pts), width, height) : null,
+      areaRatio: chosen ? polygonArea(chosen.pts) / frameArea : 0,
+      strategy: chosen ? chosen.strategy + (chosen.hull ? '-hull' : '') : null,
+      candidates: evaluated.length,
+      passed: evaluated.filter((q) => q.ok).length,
+      score: top ? { contrast: round1(top.contrast), paper: round1(top.paper), valid: round1(top.valid) } : null,
       brightness: Math.round(brightness),
       sharpness: Math.round(sharpness),
+      readMs,
+      grayMs,
+      enhancedMs,
       detectMs: now() - t0,
+      // ภาพขอบสำหรับ ?view=edges (คัดลอกออกจาก WASM heap)
+      edges: wantEdges ? new Uint8Array(edges.data).buffer : null,
+      edgesWidth: edgesSize.width,
+      edgesHeight: edgesSize.height,
     };
   } finally {
     mats.forEach((m) => m.delete());
   }
 }
 
-/** เลือกรูปสี่เหลี่ยมนูนที่ใหญ่ที่สุดและใหญ่กว่าเกณฑ์ขั้นต่ำ */
-function findBestQuad(c, contours, frameArea) {
-  const minArea = frameArea * detectConf.minAreaRatio;
+const round1 = (v) => Math.round(v * 10) / 10;
+
+function scoreAll(labImg, candidates, strategy) {
+  return candidates.map((q) => {
+    const s = scoreBoundary(labImg, q.pts);
+    const conf = detectConf.score;
+    const ok = s.valid >= conf.minValid && s.contrast >= conf.minContrast && s.paper >= conf.minPaper;
+    return { ...q, ...s, strategy, ok };
+  });
+}
+
+/** จากตัวเลือกที่ผ่านเกณฑ์ เลือกตัวที่ใหญ่ที่สุด (กระดาษครอบกรอบที่พิมพ์ข้างในเสมอ) */
+function choose(evaluated) {
   let best = null;
+  for (const q of evaluated) {
+    if (q.ok && (!best || q.area > best.area)) best = q;
+  }
+  return best;
+}
+
+/**
+ * สุ่มจุดตามแต่ละด้าน แล้วเทียบสี Lab ห่างจากเส้นเข้าไปด้านในและออกไปด้านนอก sampleDist px
+ *  contrast : ค่ามัธยฐานของระยะสี (ΔE แบบ 8-bit) ระหว่างด้านในกับด้านนอก
+ *  paper    : สัดส่วนจุดด้านในที่ "ดูเป็นกระดาษ" (สว่างพอ และสีไม่จัด)
+ *  valid    : สัดส่วนจุดด้านนอกที่ยังอยู่ในเฟรม (ต่ำ = เอกสารล้นขอบเฟรม)
+ */
+function scoreBoundary(img, pts) {
+  const { sampleDist: d, samplesPerSide: n, paperMinL, paperMaxChroma } = detectConf.score;
+  const cx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const cy = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+  const diffs = [];
+  let paperHits = 0;
+  let insideCount = 0;
+  let total = 0;
+
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    const len = dist(a, b);
+    if (!len) continue;
+    let nx = -(b.y - a.y) / len;
+    let ny = (b.x - a.x) / len;
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    if (nx * (mx - cx) + ny * (my - cy) < 0) { nx = -nx; ny = -ny; }   // ให้ชี้ออกนอกรูป
+
+    for (let k = 1; k <= n; k++) {
+      const t = k / (n + 1);
+      const px = a.x + (b.x - a.x) * t;
+      const py = a.y + (b.y - a.y) * t;
+      total++;
+      const inside = sampleLab(img, px - nx * d, py - ny * d);
+      if (!inside) continue;
+      insideCount++;
+      const chroma = Math.hypot(inside[1] - 128, inside[2] - 128);
+      if (inside[0] >= paperMinL && chroma <= paperMaxChroma) paperHits++;
+      const outside = sampleLab(img, px + nx * d, py + ny * d);
+      if (!outside) continue;
+      diffs.push(Math.hypot(inside[0] - outside[0], inside[1] - outside[1], inside[2] - outside[2]));
+    }
+  }
+  diffs.sort((x, y) => x - y);
+  return {
+    contrast: diffs.length ? diffs[Math.floor(diffs.length / 2)] : 0,
+    paper: insideCount ? paperHits / insideCount : 0,
+    valid: total ? diffs.length / total : 0,
+  };
+}
+
+function sampleLab({ data, width, height }, x, y) {
+  const xi = Math.round(x);
+  const yi = Math.round(y);
+  if (xi < 0 || yi < 0 || xi >= width || yi >= height) return null;
+  const i = (yi * width + xi) * 3;
+  return [data[i], data[i + 1], data[i + 2]];
+}
+
+/** วิธีที่ 1: Blur → Canny (threshold จาก Otsu) → Dilate */
+function grayEdges(c, gray, track) {
+  const blurred = track(new c.Mat());
+  c.GaussianBlur(gray, blurred, new c.Size(5, 5), 0);
+  const bin = track(new c.Mat());
+  const otsu = c.threshold(blurred, bin, 0, 255, c.THRESH_BINARY + c.THRESH_OTSU);
+  const edges = new c.Mat();
+  c.Canny(blurred, edges, otsu * 0.5, otsu);
+  const kernel = track(c.Mat.ones(3, 3, c.CV_8U));
+  c.dilate(edges, edges, kernel);
+  return edges;
+}
+
+/**
+ * วิธีที่ 2: ขอบจากทั้ง 3 ช่องของ Lab รวมกัน แล้วปิดช่องว่างด้วย Morphological Close
+ * ย่อภาพเหลือ enhanced.longSide ก่อน เพราะวิธีนี้หนักกว่าวิธีแรกหลายเท่า (คืน scale ไว้แปลงพิกัดกลับ)
+ */
+function enhancedEdges(c, lab, track) {
+  const e = detectConf.enhanced;
+  let input = lab;
+  let scale = 1;
+  const longSide = Math.max(lab.cols, lab.rows);
+  if (e.longSide && longSide > e.longSide) {
+    scale = e.longSide / longSide;
+    input = track(new c.Mat());
+    c.resize(lab, input, new c.Size(Math.round(lab.cols * scale), Math.round(lab.rows * scale)), 0, 0, c.INTER_AREA);
+  }
+  const planes = track(new c.MatVector());
+  c.split(input, planes);
+
+  const combined = c.Mat.zeros(input.rows, input.cols, c.CV_8UC1);
+  const ksize = new c.Size(e.blur, e.blur);
+  for (let i = 0; i < 3; i++) {
+    const channel = track(planes.get(i));
+    const prepared = track(new c.Mat());
+    if (i === 0) applyClahe(c, channel, prepared, e.clipLimit);   // L: ความสว่าง
+    else stretch(channel, prepared, e.stretchPercent, e.maxGain);  // a, b: โทนสี
+    c.GaussianBlur(prepared, prepared, ksize, 0);
+    const channelEdges = track(new c.Mat());
+    c.Canny(prepared, channelEdges, e.cannyLow, e.cannyHigh);
+    c.bitwise_or(combined, channelEdges, combined);
+  }
+  const kernel = track(c.Mat.ones(e.closeKernel, e.closeKernel, c.CV_8U));
+  c.morphologyEx(combined, combined, c.MORPH_CLOSE, kernel);
+  return { edges: combined, scale };
+}
+
+function applyClahe(c, src, dst, clipLimit) {
+  if (typeof c.CLAHE === 'function') {
+    const clahe = new c.CLAHE(clipLimit, new c.Size(8, 8));
+    try {
+      clahe.apply(src, dst);
+    } finally {
+      clahe.delete();
+    }
+  } else {
+    c.equalizeHist(src, dst);
+  }
+}
+
+/** ยืดช่วงค่าโดยตัดหัวท้าย pct% (กันหมึกสีบนเอกสารดึงช่วงทั้งหมด) และจำกัดอัตราขยายกัน noise */
+function stretch(src, dst, pct, maxGain) {
+  const data = src.data;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < data.length; i++) hist[data[i]]++;
+  const cut = (data.length * pct) / 100;
+  let lo = 0;
+  for (let acc = 0; lo < 255 && (acc += hist[lo]) < cut;) lo++;
+  let hi = 255;
+  for (let acc = 0; hi > 0 && (acc += hist[hi]) < cut;) hi--;
+  const gain = Math.min(255 / Math.max(hi - lo, 1), maxGain);
+  src.convertTo(dst, -1, gain, -lo * gain);
+}
+
+function searchCandidates(c, edges, mode, allowHull, track) {
+  const contours = track(new c.MatVector());
+  const hierarchy = track(new c.Mat());
+  c.findContours(edges, contours, hierarchy, mode, c.CHAIN_APPROX_SIMPLE);
+  return findCandidates(contours, edges.cols * edges.rows, allowHull);
+}
+
+/**
+ * รวบรวมสี่เหลี่ยมทุกตัวที่ผ่านเกณฑ์ ขนาด · นูน · มุมภายใน (เรียงจากใหญ่ไปเล็ก ไม่เกิน maxCandidates)
+ * contour ที่ไม่เป็น 4 มุมตรง ๆ และ allowHull จะลองใช้ Convex Hull ของ contour แทน
+ */
+function findCandidates(contours, frameArea, allowHull) {
+  const minArea = frameArea * detectConf.minAreaRatio;
+  const maxArea = frameArea * detectConf.maxAreaRatio;
+  const inRange = (a) => a >= minArea && a <= maxArea;
+  const out = [];
 
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     try {
+      let direct = false;
       const area = geom.contourArea(cnt);
-      if (area < minArea || (best && area <= best.area)) continue;
-      const peri = geom.arcLength(cnt);
+      if (inRange(area)) {
+        const peri = geom.arcLength(cnt);
+        for (const eps of detectConf.epsilons) {
+          // OpenCV 5 คืนผลของ vector เป็น Mat 1 มิติ จึงนับจำนวนจุดแทนการดู .rows
+          const pts = geom.approx(cnt, eps * peri);
+          if (isDocumentQuad(pts)) {
+            out.push({ pts, area: polygonArea(pts), hull: false });
+            direct = true;
+            break;
+          }
+        }
+      }
 
-      for (const eps of detectConf.epsilons) {
-        const pts = geom.approx(cnt, eps * peri);
-        // OpenCV 5 คืนผลของ vector เป็น Mat 1 มิติ (rows = 1) จึงนับจำนวนจุดแทนการดู .rows
-        if (pts.length === 4 && isConvexPolygon(pts)) {
-          best = { pts, area: polygonArea(pts) };
-          break;
+      if (allowHull && !direct) {
+        const pts = matPoints(cnt);
+        if (boundingArea(pts) < minArea) continue;
+        const hull = convexHull(pts);
+        const hullArea = polygonArea(hull);
+        if (!inRange(hullArea)) continue;
+        const hullPeri = perimeter(hull);
+        for (const eps of detectConf.epsilons) {
+          const rough = approxClosed(hull, eps * hullPeri);
+          if (rough.length !== 4) continue;
+          // มุมกระดาษมักหายไปเมื่อขอบขาดเป็นช่วง จึงต่อเส้นขอบแต่ละด้านแล้วหาจุดตัดเป็นมุมจริง
+          const q = refineCorners(hull, rough);
+          // hull ต้องเต็มสี่เหลี่ยมเกือบทั้งหมด ไม่ใช่รูปหลายเหลี่ยมที่ถูกบีบให้เหลือ 4 มุม
+          if (q && isDocumentQuad(q) && hullArea / polygonArea(q) >= detectConf.hullFill) {
+            out.push({ pts: q, area: polygonArea(q), hull: true });
+            break;
+          }
         }
       }
     } finally {
       cnt.delete();
     }
   }
-  return best;
+  out.sort((x, y) => y.area - x.area);
+  return out.slice(0, detectConf.maxCandidates);
+}
+
+/**
+ * ใช้ขอบที่ยาวที่สุดของ hull ในแต่ละด้านเป็นเส้นตรงของด้านนั้น แล้วหาจุดตัดของด้านที่ติดกัน
+ * rough คือ 4 จุดที่อยู่บน hull (ได้จาก approxClosed ซึ่งเลือกจากจุดเดิมเสมอ)
+ */
+function refineCorners(hull, rough) {
+  const idx = rough.map((p) => hull.indexOf(p));
+  if (idx.some((i) => i < 0)) return null;
+  const order = [...idx].sort((a, b) => a - b);
+  const n = hull.length;
+  const lines = [];
+  for (let s = 0; s < 4; s++) {
+    const from = order[s];
+    const to = order[(s + 1) % 4] + (s === 3 ? n : 0);
+    let bestLen = -1;
+    let line = null;
+    for (let k = from; k < to; k++) {
+      const a = hull[k % n];
+      const b = hull[(k + 1) % n];
+      const len = dist(a, b);
+      if (len > bestLen) { bestLen = len; line = [a, b]; }
+    }
+    if (!line) return null;
+    lines.push(line);
+  }
+  const corners = [];
+  for (let s = 0; s < 4; s++) {
+    const p = intersect(lines[(s + 3) % 4], lines[s]);
+    if (!p) return null;
+    corners.push(p);
+  }
+  return corners;
+}
+
+function intersect([p1, p2], [p3, p4]) {
+  const d = (p1.x - p2.x) * (p3.y - p4.y) - (p1.y - p2.y) * (p3.x - p4.x);
+  if (Math.abs(d) < 1e-9) return null;
+  const a = p1.x * p2.y - p1.y * p2.x;
+  const b = p3.x * p4.y - p3.y * p4.x;
+  return {
+    x: (a * (p3.x - p4.x) - (p1.x - p2.x) * b) / d,
+    y: (a * (p3.y - p4.y) - (p1.y - p2.y) * b) / d,
+  };
+}
+
+function isDocumentQuad(pts) {
+  return pts.length === 4 && isConvexPolygon(pts) && anglesWithin(pts, detectConf.minAngle, detectConf.maxAngle);
+}
+
+/** มุมภายในทุกมุมต้องอยู่ในช่วง กันรูปสี่เหลี่ยมบิดเบี้ยวที่ไม่น่าใช่กระดาษ */
+function anglesWithin(q, minDeg, maxDeg) {
+  for (let i = 0; i < q.length; i++) {
+    const a = q[(i + q.length - 1) % q.length];
+    const b = q[i];
+    const c = q[(i + 1) % q.length];
+    const v1x = a.x - b.x;
+    const v1y = a.y - b.y;
+    const v2x = c.x - b.x;
+    const v2y = c.y - b.y;
+    const cos = (v1x * v2x + v1y * v2y) / (Math.hypot(v1x, v1y) * Math.hypot(v2x, v2y));
+    const deg = (Math.acos(Math.max(-1, Math.min(1, cos))) * 180) / Math.PI;
+    if (!(deg >= minDeg && deg <= maxDeg)) return false;
+  }
+  return true;
+}
+
+function boundingArea(pts) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return (maxX - minX) * (maxY - minY);
+}
+
+/** Convex Hull แบบ Monotone Chain (ไม่พึ่งโมดูล geometry ของ OpenCV 5) */
+function convexHull(pts) {
+  if (pts.length < 3) return pts.slice();
+  const p = [...pts].sort((a, b) => a.x - b.x || a.y - b.y);
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower = [];
+  for (const q of p) {
+    while (lower.length >= 2 && cross(lower.at(-2), lower.at(-1), q) <= 0) lower.pop();
+    lower.push(q);
+  }
+  const upper = [];
+  for (let i = p.length - 1; i >= 0; i--) {
+    const q = p[i];
+    while (upper.length >= 2 && cross(upper.at(-2), upper.at(-1), q) <= 0) upper.pop();
+    upper.push(q);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
 }
 
 /* -------------------------------------------------------------- geometry

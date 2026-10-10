@@ -32,3 +32,25 @@ export class FrameGrabber {
     this.canvas.height = 0;
   }
 }
+
+export const canGrabBitmap =
+  typeof createImageBitmap === 'function' && typeof OffscreenCanvas === 'function';
+
+/**
+ * ย่อเฟรมด้วย createImageBitmap (ทำบน GPU) แล้วส่ง bitmap ให้ worker อ่านพิกเซลเอง
+ * main thread จึงไม่ต้องรอ getImageData ซึ่งช้ามากบน Android เมื่อ stream เป็น 4K
+ */
+export async function grabBitmap(video, longSide) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const scale = Math.min(1, longSide / Math.max(vw, vh));
+  const width = Math.round(vw * scale);
+  const height = Math.round(vh * scale);
+  const bitmap = await createImageBitmap(video, {
+    resizeWidth: width,
+    resizeHeight: height,
+    resizeQuality: 'low',
+  });
+  return { bitmap, width, height };
+}

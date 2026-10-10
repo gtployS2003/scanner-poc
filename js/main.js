@@ -1,7 +1,7 @@
-import { CONFIG } from './config.js';
+import { CONFIG, APP_VERSION } from './config.js';
 import { device, environmentChecks } from './utils/device.js';
 import { CameraService, explainCameraError } from './camera/camera-service.js';
-import { FrameGrabber } from './camera/frame-grabber.js';
+import { FrameGrabber, grabBitmap, canGrabBitmap } from './camera/frame-grabber.js';
 import { VisionClient } from './vision/vision-client.js';
 import { Overlay } from './ui/overlay.js';
 import { Stats, DebugPanel } from './ui/debug-panel.js';
@@ -16,6 +16,7 @@ const el = {
   startMsg: $('start-msg'),
   video: $('video'),
   overlay: $('overlay'),
+  edges: $('edges'),
   pill: $('status-pill'),
   debug: $('debug'),
   debugRows: $('debug-rows'),
@@ -37,8 +38,10 @@ const state = {
   lastSentAt: 0,
   cvInfo: null,
   cvError: null,
+  cvProgress: 'เริ่มโหลด',
   camInfo: null,
   quad: null,
+  grabMode: CONFIG.grab === 'bitmap' && canGrabBitmap ? 'bitmap' : 'canvas',
   lastWarp: null,
   resultUrl: null,
 };
@@ -117,6 +120,7 @@ async function loadVision() {
   const urls = forceRemote ? [remoteUrl] : [local, remoteUrl];
   try {
     vision = new VisionClient();
+    vision.onProgress = onCvProgress;
     state.cvInfo = await vision.init({ urls, timeoutMs: loadTimeoutMs, detect: CONFIG.detect });
     el.captureBtn.disabled = false;
     setPill('เล็งไปที่เอกสาร');
@@ -124,6 +128,28 @@ async function loadVision() {
     state.cvError = err.message;
     setPill('โหลด OpenCV ไม่สำเร็จ', 'error');
     console.error(err);
+  }
+  debugPanel.render(state, stats, true);
+}
+
+function onCvProgress(p) {
+  const file = p.url?.includes('docs.opencv.org') ? 'remote' : 'local';
+  if (p.phase === 'download') {
+    if (p.note) {
+      state.cvProgress = `${file}: ${p.note}`;
+    } else {
+      const mb = (p.loaded / 1048576).toFixed(1);
+      const pct = p.total ? ` (${Math.round((p.loaded / p.total) * 100)}%)` : '';
+      state.cvProgress = `${file}: ดาวน์โหลด ${mb} MB${pct}`;
+      setPill(`กำลังโหลด OpenCV${pct}`);
+    }
+  } else if (p.phase === 'evaluate') {
+    state.cvProgress = `${file}: ประมวลผลสคริปต์${p.bytes ? ` ${(p.bytes / 1048576).toFixed(1)} MB` : ''}`;
+    setPill('กำลังเตรียม OpenCV');
+  } else if (p.phase === 'runtime') {
+    state.cvProgress = `รอ runtime พร้อม (cv เป็น ${p.cvType})`;
+  } else if (p.phase === 'fallback') {
+    state.cvProgress = `${file} ไม่สำเร็จ: ${p.error}`;
   }
   debugPanel.render(state, stats, true);
 }
@@ -146,19 +172,24 @@ async function runDetect() {
   state.lastSentAt = performance.now();
   try {
     const t0 = performance.now();
-    const frame = detectGrabber.grab(el.video, CONFIG.detect.longSide);
+    const frame = await grabFrame();
     if (!frame) return;
     const grabMs = performance.now() - t0;
 
-    const r = await vision.detect(frame);
+    const r = await vision.detect(frame, showEdges);
     const roundMs = performance.now() - t0;
     if (state.paused || state.capturing) return;
 
     stats.add({
       grabMs,
+      readMs: r.readMs,
       detectMs: r.detectMs,
       roundMs,
       found: Boolean(r.quad),
+      strategy: r.strategy,
+      candidates: r.candidates,
+      passed: r.passed,
+      score: r.score,
       areaRatio: r.areaRatio,
       brightness: r.brightness,
       sharpness: r.sharpness,
@@ -168,11 +199,48 @@ async function runDetect() {
 
     state.quad = overlay.update(r.quad);
     setPill(state.quad ? 'พบเอกสาร' : 'เล็งไปที่เอกสาร', state.quad ? 'found' : '');
+    if (r.edges) drawEdges(r.edges, r.edgesWidth, r.edgesHeight);
   } catch (err) {
     console.error('detect failed', err);
   } finally {
     state.busy = false;
   }
+}
+
+/** ใช้ createImageBitmap ถ้าได้ ถ้าใช้ไม่ได้บนเครื่องนี้จะสลับไปแบบ canvas ถาวร */
+async function grabFrame() {
+  const longSide = CONFIG.detect.longSide;
+  if (state.grabMode === 'bitmap') {
+    try {
+      return await grabBitmap(el.video, longSide);
+    } catch (err) {
+      console.warn('createImageBitmap ใช้ไม่ได้ สลับเป็น canvas', err);
+      state.grabMode = 'canvas';
+    }
+  }
+  return detectGrabber.grab(el.video, longSide);
+}
+
+/* ---------------------------------------------------------- edges view */
+
+const showEdges = CONFIG.debug.view === 'edges';
+const edgesCtx = el.edges.getContext('2d');
+
+function drawEdges(buffer, width, height) {
+  if (el.edges.width !== width || el.edges.height !== height) {
+    el.edges.width = width;
+    el.edges.height = height;
+  }
+  const src = new Uint8Array(buffer);
+  const img = edgesCtx.createImageData(width, height);
+  for (let i = 0, j = 0; i < src.length; i++, j += 4) {
+    const v = src[i];
+    img.data[j] = v;
+    img.data[j + 1] = v ? 178 : 0;
+    img.data[j + 2] = v ? 62 : 0;
+    img.data[j + 3] = 255;
+  }
+  edgesCtx.putImageData(img, 0, 0);
 }
 
 /* -------------------------------------------------------------- capture */
@@ -273,6 +341,7 @@ function closeResult() {
 
 function buildReport() {
   return {
+    version: APP_VERSION,
     timestamp: new Date().toISOString(),
     page: location.href,
     device: {
@@ -284,6 +353,8 @@ function buildReport() {
     },
     config: {
       requestedResolution: `${CONFIG.camera.idealWidth}×${CONFIG.camera.idealHeight}`,
+      grabMode: state.grabMode,
+      enhanced: CONFIG.detect.enhanced.enabled,
       detectLongSide: CONFIG.detect.longSide,
       outputLongSide: CONFIG.output.longSide,
     },
@@ -355,6 +426,7 @@ function loadEruda() {
 /* ---------------------------------------------------------------- wire */
 
 if (CONFIG.debug.eruda) loadEruda();
+el.edges.hidden = !showEdges;
 renderChecks();
 
 el.startBtn.addEventListener('click', startScan);

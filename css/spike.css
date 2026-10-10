@@ -75,6 +75,15 @@ html, body {
 }
 .viewport video { object-fit: cover; }   /* overlay.js ต้องคำนวณ cover ให้ตรงกัน */
 
+.viewport canvas.edges {
+  inset: auto 8px 64px auto;
+  width: 34%;
+  height: auto;
+  border: 1px solid var(--lamp);
+  border-radius: var(--radius-sm);
+  background: #000;
+}
+
 .pill {
   position: absolute;
   left: 50%; bottom: 16px;
