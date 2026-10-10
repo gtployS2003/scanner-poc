@@ -188,6 +188,7 @@ async function runDetect() {
       roundMs,
       found: Boolean(r.quad),
       strategy: r.strategy,
+      snapped: r.snapped,
       candidates: r.candidates,
       passed: r.passed,
       score: r.score,
@@ -273,6 +274,9 @@ async function captureTest() {
     state.lastWarp = {
       frameSize,
       quadUsed: r.quadUsed,
+      snapped: r.snapped,
+      snapShiftPx: r.snapShiftPx,
+      snapMs: r.snapMs,
       naturalSize: `${r.naturalWidth}×${r.naturalHeight}`,
       outputSize: `${r.width}×${r.height}`,
       grabMs: Math.round(grabMs),
@@ -310,6 +314,7 @@ function showResult() {
   const rows = [
     ['เฟรมจากกล้อง', w.frameSize],
     ['ใช้กรอบที่ตรวจจับ', w.quadUsed ? 'ใช่' : 'ไม่พบเอกสาร ใช้ทั้งเฟรม'],
+    ['ดูดมุมบนภาพเต็ม', w.quadUsed ? `${w.snapped}/4 ด้าน · มุมเลื่อนเฉลี่ย ${w.snapShiftPx} px · ${w.snapMs} ms` : '-'],
     ['ขนาดเอกสารในเฟรม', `${w.naturalSize} px`],
     ['ขนาดผลลัพธ์', `${w.outputSize} px`],
     ['ดึงเฟรมเต็ม', `${w.grabMs} ms`],

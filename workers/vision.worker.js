@@ -19,6 +19,7 @@ let detectConf = {
   fitTolerance: 0.02,
   fitMinPoints: 8,
   fitMaxShift: 0.03,
+  snap: null,
   enhanced: null,
   score: null,
 };
@@ -298,6 +299,15 @@ function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
       enhancedMs = now() - tEnh;
     }
 
+    // ดูดมุมเข้าหาขอบกระดาษจริงบนช่อง L (ไม่ขึ้นกับว่า contour เละแค่ไหน)
+    let snapped = 0;
+    if (chosen && detectConf.snap?.enabled) {
+      const L = (x, y) => labImg.data[(y * width + x) * 3];
+      const r = snapQuad(L, width, height, orderCorners(chosen.pts), detectConf.snap, detectConf.snap.samplesLive);
+      chosen = { ...chosen, pts: r.pts };
+      snapped = r.sides;
+    }
+
     // ตัวเลือกที่ดีที่สุดแม้ไม่ผ่าน ไว้ดูใน debug ว่าคะแนนห่างจากเกณฑ์เท่าไร
     const top = chosen ?? evaluated.sort((x, y) => y.contrast - x.contrast)[0] ?? null;
 
@@ -307,6 +317,7 @@ function detect({ buffer, bitmap, width, height, wantEdges, prevQuad }) {
       quad: chosen ? normalize(orderCorners(chosen.pts), width, height) : null,
       areaRatio: chosen ? polygonArea(chosen.pts) / frameArea : 0,
       strategy: chosen ? chosen.strategy + (chosen.hull ? '-hull' : '') : null,
+      snapped,
       candidates: evaluated.length,
       passed: evaluated.filter((q) => q.ok).length,
       score: top ? { contrast: round1(top.contrast), paper: round1(top.paper), valid: round1(top.valid) } : null,
@@ -859,6 +870,103 @@ function normalize(pts, width, height) {
   return pts.map((p) => ({ x: p.x / width, y: p.y / height }));
 }
 
+/* ------------------------------------------------------------------ snap
+ * ดูดแต่ละด้านของกรอบเข้าหาขอบกระดาษจริง
+ *  ตามแนวด้าน สุ่มจุดช่วงกลาง 10–90% แล้วไล่ตั้งฉากกับเส้นในระยะ ±radius
+ *  ที่แต่ละตำแหน่งเทียบค่าเฉลี่ยความสว่าง "band" px ด้านนอกกับด้านใน
+ *  ขอบกระดาษ = ขั้นบันได (ในสว่าง นอกมืด หรือกลับกัน) → ต่างกันมาก
+ *  เส้นพิมพ์บาง ๆ บนฟอร์ม = ขาวทั้งสองข้าง → ต่างกันน้อย จึงไม่ถูกดูดเข้าไป
+ *  จุดที่ได้ fit เป็นเส้นแบบตัดจุดแปลกปลอม แล้วใช้จุดตัดเป็นมุมใหม่
+ *  ด้านที่จุดไม่พอ หรือมุมใหม่ขยับเกิน 2×radius / หลุดเฟรม → ใช้ของเดิม
+ *
+ * L(x, y) คืนความสว่าง 0–255 ของพิกเซล (จำนวนเต็ม) · quad เรียง TL, TR, BR, BL ในพิกัดพิกเซล
+ */
+function snapQuad(L, width, height, quad, conf, samples) {
+  const longSide = Math.max(width, height);
+  const radius = Math.max(2, Math.round(conf.radius * longSide));
+  const band = Math.max(1, Math.round(conf.band * longSide));
+  const cx = quad.reduce((s, p) => s + p.x, 0) / 4;
+  const cy = quad.reduce((s, p) => s + p.y, 0) / 4;
+  const read = (x, y) => {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || yi < 0 || xi >= width || yi >= height) return null;
+    return L(xi, yi);
+  };
+
+  const lines = [];
+  let sides = 0;
+  for (let s = 0; s < 4; s++) {
+    const a = quad[s];
+    const b = quad[(s + 1) % 4];
+    const len = dist(a, b);
+    let nx = -(b.y - a.y) / len;
+    let ny = (b.x - a.x) / len;
+    if (nx * ((a.x + b.x) / 2 - cx) + ny * ((a.y + b.y) / 2 - cy) < 0) { nx = -nx; ny = -ny; }
+
+    const found = [];
+    for (let j = 0; j < samples; j++) {
+      const t = 0.1 + (0.8 * (j + 0.5)) / samples;
+      const px = a.x + (b.x - a.x) * t;
+      const py = a.y + (b.y - a.y) * t;
+      // ค่าความสว่างตามแนวตั้งฉาก ตั้งแต่ -(radius+band) ถึง +(radius+band)
+      const span = radius + band;
+      const prof = [];
+      let ok = true;
+      for (let d = -span; d <= span; d++) {
+        const v = read(px + nx * d, py + ny * d);
+        if (v === null) { ok = false; break; }
+        prof.push(v);
+      }
+      if (!ok) continue;
+      // prefix sum เพื่อหาค่าเฉลี่ยช่วงได้เร็ว
+      const pre = [0];
+      for (const v of prof) pre.push(pre.at(-1) + v);
+      let bestD = 0;
+      let bestDiff = 0;
+      for (let d = -radius; d <= radius; d++) {
+        const i = d + span;                                  // index ของตำแหน่ง d ใน prof
+        const inside = (pre[i] - pre[i - band]) / band;      // band px ก่อนถึงตำแหน่งนี้ (ด้านใน)
+        const outside = (pre[i + 1 + band] - pre[i + 1]) / band;   // band px หลังตำแหน่งนี้ (ด้านนอก)
+        const diff = outside - inside;
+        if (Math.abs(diff) > Math.abs(bestDiff)) { bestDiff = diff; bestD = d; }
+      }
+      if (Math.abs(bestDiff) >= conf.minStep) {
+        found.push({ x: px + nx * bestD, y: py + ny * bestD, sign: Math.sign(bestDiff) });
+      }
+    }
+
+    // ขอบกระดาษหนึ่งด้านควรเป็นทิศเดียวกันตลอด (ในสว่างกว่านอก หรือกลับกัน) ตัดจุดที่สวนทาง
+    const pos = found.filter((p) => p.sign > 0).length;
+    const pts = found.filter((p) => (pos * 2 >= found.length ? p.sign > 0 : p.sign < 0));
+    if (pts.length >= Math.max(6, samples * conf.minCoverage)) {
+      let near = pts;
+      let line = fitLine(near);
+      for (let iter = 0; iter < 2; iter++) {
+        const res = near.map((p) => lineDistance(p, line));
+        const med = [...res].sort((x, y) => x - y)[Math.floor(res.length / 2)];
+        const kept = near.filter((_, i) => res[i] <= Math.max(1, med * 2.5));
+        if (kept.length < 6 || kept.length === near.length) break;
+        near = kept;
+        line = fitLine(near);
+      }
+      lines.push(line);
+      sides++;
+    } else {
+      lines.push([a, b]);
+    }
+  }
+
+  const out = [];
+  for (let s = 0; s < 4; s++) {
+    const p = intersect(lines[(s + 3) % 4], lines[s]);
+    const okPoint = p && dist(p, quad[s]) <= radius * 2 && p.x >= 0 && p.y >= 0 && p.x <= width && p.y <= height;
+    out.push(okPoint ? p : quad[s]);
+  }
+  if (!isDocumentQuad(out)) return { pts: quad, sides: 0 };
+  return { pts: out, sides };
+}
+
 /* ------------------------------------------------------------------ warp */
 
 const FULL_FRAME = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
@@ -872,7 +980,25 @@ function warp({ buffer, width, height, quad, outLongSide }) {
   const track = (m) => { mats.push(m); return m; };
 
   try {
-    const corners = (quad ?? FULL_FRAME).map((p) => ({ x: p.x * width, y: p.y * height }));
+    let corners = (quad ?? FULL_FRAME).map((p) => ({ x: p.x * width, y: p.y * height }));
+
+    // ดูดมุมอีกรอบบนภาพความละเอียดเต็ม: กรอบบนจอผ่านการ smooth และหามาจากภาพย่อ
+    // จึงคลาดจากขอบจริงได้หลายสิบ px ที่ 4K
+    let snapped = 0;
+    let snapShift = 0;
+    const tSnap = now();
+    if (quad && detectConf.snap?.enabled) {
+      const px = new Uint8Array(buffer);
+      const L = (x, y) => {
+        const i = (y * width + x) * 4;
+        return 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+      };
+      const r = snapQuad(L, width, height, corners, detectConf.snap, detectConf.snap.samplesCapture);
+      snapShift = r.pts.reduce((sum, p, i) => sum + dist(p, corners[i]), 0) / 4;
+      corners = r.pts;
+      snapped = r.sides;
+    }
+    const snapMs = now() - tSnap;
     const [tl, tr, br, bl] = corners;
     const natW = Math.max(dist(tl, tr), dist(bl, br));
     const natH = Math.max(dist(tl, bl), dist(tr, br));
@@ -901,6 +1027,9 @@ function warp({ buffer, width, height, quad, outLongSide }) {
       naturalWidth: Math.round(natW),
       naturalHeight: Math.round(natH),
       quadUsed: Boolean(quad),
+      snapped,
+      snapShiftPx: Math.round(snapShift),
+      snapMs: Math.round(snapMs),
       warpMs: now() - t0,
     };
   } finally {
